@@ -160,7 +160,3 @@ git push -u origin main
 * **Conda kernel missing** → `python -m ipykernel install --user --name myenv --display-name "Python (myenv)"` in that env.
 
 ---
-
-## 📝 License
-
-MIT (or your preferred license).
