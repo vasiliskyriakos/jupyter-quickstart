@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# newjupyter — generate a ready-to-run Python + Jupyter + VS Code project
+# Usage: newjupyter <project-name> [--no-open] [--conda] [--python=/usr/local/bin/python3]
+
+OPEN_CODE="yes"      # --no-open to skip opening VS Code
+USE_CONDA="no"       # --conda to use conda instead of venv
+PYTHON_BIN="python3" # --python=/path/to/python
+PROJECT_NAME=""
+
+# --- Pretty terminal helpers (spinner + step runner, minimal output) ---
+log_file="/tmp/newjupyter_step.log"
+
+run_step() {
+  local label="$1"; shift
+  printf "\n• %s..." "$label"
+
+  ("$@") >"$log_file" 2>&1 &
+  local pid=$!
+
+  local spin='-\|/' i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i+1) % 4 ))
+    printf "\r• %s... %s" "$label" "${spin:$i:1}"
+    sleep 0.2
+  done
+
+  wait "$pid"; local status=$?
+  if [ $status -eq 0 ]; then
+    printf "\r✓ %s\n" "$label"
+  else
+    printf "\r✗ %s (see first lines below)\n" "$label"
+    sed -n '1,80p' "$log_file" | sed 's/^/  > /'
+    exit $status
+  fi
+}
+
+# -------- parse args --------
+for arg in "$@"; do
+  case "$arg" in
+    --no-open) OPEN_CODE="no" ;;
+    --conda)   USE_CONDA="yes" ;;
+    --python=*) PYTHON_BIN="${arg#*=}" ;;
+    --*) ;;  # ignore unknown flags
+    *) if [[ -z "$PROJECT_NAME" ]]; then PROJECT_NAME="$arg"; fi ;;
+  esac
+done
+
+if [[ -z "$PROJECT_NAME" ]]; then
+  echo "Usage: newjupyter <project-name> [--no-open] [--conda] [--python=/usr/local/bin/python3]"
+  exit 1
+fi
+
+# -------- scaffold --------
+if [[ -e "$PROJECT_NAME" ]]; then
+  echo "Error: '$PROJECT_NAME' already exists."
+  exit 1
+fi
+mkdir -p "$PROJECT_NAME"/{.vscode,notebooks,src,scripts}
+cd "$PROJECT_NAME"
+
+# .gitignore
+cat > .gitignore <<'GIT'
+.venv/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+GIT
+
+# VS Code settings
+cat > .vscode/settings.json <<'JSON'
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "jupyter.jupyterServerType": "local",
+  "jupyter.askForKernelRestart": false
+}
+JSON
+
+# requirements
+cat > requirements.txt <<'REQ'
+numpy
+pandas
+matplotlib
+scikit-learn
+REQ
+
+# Makefile (plain, no colors)
+cat > Makefile <<'MAKE'
+# Makefile — Python + Jupyter + VS Code + GitHub (no colors)
+
+PY ?= python3
+VENV ?= .venv
+KERNEL ?= myenv
+
+.PHONY: help setup env install-jupyter kernel install-ml code notebook lab clean deps run \
+        git-init github-setup github-create github-publish-gh publish _git_sanity
+
+help:
+	@echo "Commands:"
+	@echo "  make setup             -> .venv + Jupyter + kernel + ML libs"
+	@echo "  make code              -> open VS Code here"
+	@echo "  make notebook          -> start Jupyter Notebook (browser)"
+	@echo "  make lab               -> install & start JupyterLab"
+	@echo "  make deps              -> install from requirements.txt (optional)"
+	@echo "  make run               -> run scripts/script.py inside the venv"
+	@echo "  make clean             -> remove .venv"
+	@echo "  --- GitHub ---"
+	@echo "  make github-setup      -> install gh (Homebrew) & login"
+	@echo "  make github-publish-gh -> init repo, create GitHub repo (gh) & push"
+	@echo "  make publish           -> quick commit & push (MSG=\"...\")"
+
+env:
+	$(PY) -m venv $(VENV)
+	. $(VENV)/bin/activate && pip install --upgrade pip
+
+install-jupyter:
+	. $(VENV)/bin/activate && pip install jupyter ipykernel
+
+kernel:
+	. $(VENV)/bin/activate && $(PY) -m ipykernel install --user --name $(KERNEL) --display-name "Python ($(KERNEL))"
+
+install-ml:
+	. $(VENV)/bin/activate && pip install -r requirements.txt
+
+setup: env install-jupyter kernel install-ml
+
+code:
+	@if command -v code >/dev/null 2>&1; then code -n .; else open -n -a "Visual Studio Code" .; fi
+
+notebook:
+	. $(VENV)/bin/activate && jupyter notebook
+
+lab:
+	. $(VENV)/bin/activate && pip install jupyterlab && jupyter lab
+
+deps:
+	. $(VENV)/bin/activate && test -f requirements.txt && pip install -r requirements.txt || echo "No requirements.txt"
+
+run:
+	. $(VENV)/bin/activate && python scripts/script.py
+
+clean:
+	rm -rf $(VENV)
+
+# ---------- Git / GitHub ----------
+REPO_NAME ?= $(notdir $(shell pwd))
+MSG ?= Update
+
+git-init:
+	@if ! command -v git >/dev/null 2>&1; then echo "git not found"; exit 1; fi
+	@if [ ! -d .git ]; then git init && git branch -M main; else echo "git repo already exists"; fi
+	@touch README.md
+	@git add .
+	@git commit -m "Initial commit" || true
+	@echo "git init + first commit"
+
+github-setup:
+	@if ! command -v brew >/dev/null 2>&1; then echo "Homebrew not found. Install from https://brew.sh"; exit 1; fi
+	brew install gh || true
+	gh auth login
+	@echo "gh ready"
+
+# Use gh; infer repo name from folder
+github-create:
+	@if ! command -v gh >/dev/null 2>&1; then echo "gh (GitHub CLI) not found. Run: make github-setup"; exit 1; fi
+	gh repo create --source=. --public --remote=origin --push
+	@echo "GitHub repo created & pushed"
+
+github-publish-gh: git-init github-create
+
+_git_sanity:
+	@if ! command -v git >/dev/null 2>&1; then echo "git not found"; exit 1; fi
+	@if [ ! -d .git ]; then echo "Not a git repo. Run: make github-publish-gh"; exit 1; fi
+	@if ! git remote | grep -q '^origin$$'; then echo "No 'origin' remote set. Run: make github-publish-gh"; exit 1; fi
+
+publish: _git_sanity
+	git add .
+	@git diff --cached --quiet && echo "Nothing to commit" || git commit -m "$(MSG)" || true
+	git push -u origin main
+	@echo "Pushed to origin/main"
+MAKE
+
+# README (English)
+cat > README.md <<'MD'
+# 🐍 New Python + Jupyter Project
+
+A minimal, batteries-included starter for local data science with **Python**, **Jupyter**, and **VS Code** — plus one-command GitHub publishing.
+
+## Quick Start
+```bash
+make setup   # create .venv, install Jupyter + ipykernel + core libs
+make run     # run scripts/script.py (environment check)
+```
+Open `notebooks/starter.ipynb` in VS Code and select the kernel **Python (myenv)**.
+If the `code` command is missing: VS Code → Cmd+Shift+P → *Shell Command: Install 'code' command in PATH*.
+
+## Makefile Commands
+- `make setup` – venv + Jupyter + kernel + ML libs
+- `make code` – open VS Code here
+- `make notebook` – start Jupyter Notebook (browser)
+- `make lab` – install & start JupyterLab
+- `make deps` – install from requirements.txt
+- `make run` – run scripts/script.py in venv
+- `make clean` – remove .venv
+
+### GitHub
+- `make github-setup` – install GitHub CLI and log in
+- `make github-publish-gh` – init repo, create remote repo with gh, push to main
+- `make publish MSG="..."` – quick commit & push
+
+### Publish to GitHub (steps)
+1. `brew install gh` (once), then `gh auth login`
+2. From the project folder: `make github-publish-gh`
+3. Daily updates: `make publish MSG="Update"`
+
+## What’s included
+- `.vscode/settings.json` – points VS Code to the project venv
+- `requirements.txt` – core scientific stack
+- `scripts/script.py` – environment sanity check
+- `notebooks/starter.ipynb` – tiny demo notebook
+- `.gitignore` – ignores `.venv/`, `__pycache__/`, `.ipynb_checkpoints/`, etc.
+
+## Troubleshooting
+- VS Code doesn’t open with `make code` → install the `code` CLI (Cmd+Shift+P → *Shell Command: Install 'code' command in PATH*)
+- Pip uses system Python → run `make setup` so the venv is used
+- Kernel not visible → `make kernel`, then reopen the notebook
+- `gh: command not found` → `brew install gh`, then `gh auth login`
+- SSH error `permission denied (publickey)` → add SSH key to GitHub or use HTTPS
+MD
+
+# scripts/script.py (env check)
+cat > scripts/script.py <<'PY'
+#!/usr/bin/env python3
+"""
+Simple environment check with light ANSI color.
+
+Usage:
+  python scripts/script.py [--no-color]
+"""
+
+import os
+import sys
+import time
+import importlib
+from typing import List, Tuple, Optional
+
+# ---------- config ----------
+TO_CHECK: List[Tuple[str, str]] = [
+    ("numpy", "NumPy"),
+    ("pandas", "Pandas"),
+    ("matplotlib", "Matplotlib"),
+    ("sklearn", "scikit-learn"),
+]
+
+USE_COLOR = sys.stdout.isatty() and ("--no-color" not in sys.argv)
+
+# Best-effort Windows color support (optional)
+if USE_COLOR and os.name == "nt":
+    try:
+        import colorama  # type: ignore
+        colorama.just_fix_windows_console()
+    except Exception:
+        pass
+
+def c(code: str) -> str:
+    return f"\033[{code}m" if USE_COLOR else ""
+
+BOLD = c("1")
+DIM = c("2")
+CYAN = c("36")
+GREEN = c("32")
+RED = c("31")
+RESET = c("0")
+
+# ---------- tiny ui ----------
+def banner(title: str, width: int = 72) -> None:
+    width = max(50, width)
+    line = f"{CYAN}{'=' * width}{RESET}"
+    print(line)
+    pad = max(0, width - len(title) - 2)
+    print(f"{CYAN} {BOLD}{title}{RESET}{' ' * pad}")
+    print(line)
+
+def check_import(name: str) -> Tuple[bool, Optional[str], float]:
+    start = time.perf_counter()
+    try:
+        m = importlib.import_module(name)
+        ver = getattr(m, "__version__", None)
+        ok = True
+    except Exception as e:
+        ver = f"{e.__class__.__name__}"
+        ok = False
+    return ok, ver, (time.perf_counter() - start)
+
+def print_header() -> None:
+    banner("Project environment")
+    print(f"{BOLD}• Python exe{RESET} : {sys.executable}")
+    print(f"{BOLD}• CWD       {RESET} : {os.getcwd()}")
+    print(f"{BOLD}• Version   {RESET} : {sys.version.split()[0]}")
+    print()
+
+def print_table(results):
+    label_w = max(10, max(len(lbl) for _, lbl in TO_CHECK))
+    status_w = 8
+
+    header = f"{BOLD}{'Package':<{label_w}}  {'Status':<{status_w}}  Version / Error{RESET}"
+    print(header)
+    print("-" * len(header))
+
+    for (_, label), (ok, ver, dur) in zip(TO_CHECK, results):
+        status = f"{GREEN}OK{RESET}" if ok else f"{RED}MISSING{RESET}"
+        ver_str = ver or ""
+        if ok and ver_str:
+            ver_str = f"{ver_str} {DIM}({int(dur*1000)} ms){RESET}"
+        print(f"{label:<{label_w}}  {status:<{status_w + (len(RESET)+len(GREEN) if ok else len(RESET)+len(RED))}}  {ver_str}")
+
+def main() -> None:
+    # drop our flag so it doesn't leak if someone imports this module
+    if "--no-color" in sys.argv:
+        sys.argv.remove("--no-color")
+
+    print_header()
+    results = [check_import(name) for name, _ in TO_CHECK]
+    print_table(results)
+
+    missing = [lbl for (name, lbl), (ok, _, _) in zip(TO_CHECK, results) if not ok]
+    print()
+    if missing:
+        need = [name for (name, lbl) in TO_CHECK if lbl in missing]
+        print(f"{RED}Tip:{RESET} inside your virtualenv run:")
+        print("  pip install " + " ".join(need))
+        sys.exit(1)
+    else:
+        print(f"{GREEN}All good. You're ready to go!{RESET}\n")
+
+if __name__ == "__main__":
+    main()
+
+PY
+chmod +x scripts/script.py
+
+# notebooks/starter.ipynb
+cat > notebooks/starter.ipynb <<'NB'
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+     "# Starter Notebook",
+     "",
+     "Welcome! This notebook verifies your environment and renders a tiny procedural-art demo (Perlin noise).",
+     "",
+     "**What you'll see:**",
+     "- Environment check (Python, NumPy, Pandas, Matplotlib)",
+     "- A small Perlin-noise texture rendered with Matplotlib",
+     "",
+     "Tip: If the VS Code 'code' command is missing in your terminal, open VS Code and run: Shell Command: Install 'code' command in PATH."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "outputs": [],
+   "execution_count": null,
+   "source": [
+     "# Environment check",
+     "import sys, os",
+     "import numpy as np, pandas as pd, matplotlib, matplotlib.pyplot as plt",
+     "print('Python   :', sys.version.split()[0])",
+     "print('NumPy    :', np.__version__)",
+     "print('Pandas   :', pd.__version__)",
+     "print('Matplotlib:', matplotlib.__version__)",
+     "",
+     "# quick numeric sanity",
+     "x = np.arange(5); y = x**2",
+     "print('Sample:', dict(x=list(x), y=list(y)))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+     "## Perlin-noise mini art",
+     "Perlin noise is a smooth, natural-looking noise often used for textures, clouds and terrain.",
+     "This cell auto-installs a tiny library (perlin-noise) if it is missing, then renders a simple noise image.",
+     "You can tweak parameters like octaves (detail), seed (pattern), and scale (blob size)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "outputs": [],
+   "execution_count": null,
+   "source": [
+     "# Perlin-noise mini art (single cell)",
+     "# Generates a smooth, organic texture. Re-run with different SEEDs for new art.",
+     "try:",
+     "    from perlin_noise import PerlinNoise",
+     "except ImportError:",
+     "    import sys, subprocess",
+     "    _ = subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'perlin-noise'])",
+     "    from perlin_noise import PerlinNoise",
+     "",
+     "import numpy as np, matplotlib.pyplot as plt",
+     "",
+     "H, W   = 400, 600",
+     "OCT    = 4",
+     "SEED   = 7",
+     "SCALE  = 6.0",
+     "",
+     "noise = PerlinNoise(octaves=OCT, seed=SEED)",
+     "",
+     "ys = np.linspace(0, SCALE, H)",
+     "xs = np.linspace(0, SCALE*W/H, W)",
+     "img = np.zeros((H, W), dtype=float)",
+     "",
+     "for i, y in enumerate(ys):",
+     "    row = [noise([y/SCALE, x/SCALE]) for x in xs]",
+     "    img[i] = (np.array(row) + 1) / 2.0",
+     "",
+     "img = np.clip(img**1.2, 0, 1)",
+     "",
+     "plt.figure(figsize=(6,4))",
+     "plt.imshow(img, interpolation='nearest')",
+     "plt.axis('off')",
+     "plt.title(f'Perlin noise (octaves={OCT}, seed={SEED})', pad=6)",
+     "plt.tight_layout()",
+     "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+     "### Next steps",
+     "- Change SEED for a different pattern.",
+     "- Increase OCT for more detail (e.g., 5–6).",
+     "- Increase SCALE for larger shapes (e.g., 10.0).",
+     "- Save the image with: plt.imsave('noise.png', img)."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": { "display_name": "Python (myenv)", "language": "python", "name": "myenv" },
+  "language_info": { "name": "python" }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+NB
+
+# -------- install env (minimal, shows only step lines) --------
+if [[ "$USE_CONDA" == "yes" ]]; then
+  cat > environment.yml <<'YML'
+name: myenv
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - ipykernel
+  - pip
+YML
+  run_step "Create/update conda env" bash -lc 'conda env create -f environment.yml || conda env update -f environment.yml'
+  run_step "Register Jupyter kernel" python -m ipykernel install --user --name myenv --display-name "Python (myenv)"
+else
+  run_step "Create virtualenv & install Jupyter/kernel/libs" make setup PY="$PYTHON_BIN"
+fi
+
+# quick environment check (after setup)
+if [[ "$USE_CONDA" == "yes" ]]; then
+  run_step "Quick environment check" python scripts/script.py --no-color || true
+else
+  run_step "Quick environment check" bash -lc '. .venv/bin/activate && python scripts/script.py --no-color' || true
+fi
+
+# --- Open project in VS Code (open FOLDER, no workspace file) ---
+if [[ "$OPEN_CODE" == "yes" ]]; then
+  sleep 0.2
+  PROJECT_DIR="$PWD"
+  if command -v code >/dev/null 2>&1; then
+    if pgrep -x "Visual Studio Code" >/dev/null 2>&1 || pgrep -x "Code" >/dev/null 2>&1; then
+      run_step "Open in VS Code (reuse window)" code --reuse-window "$PROJECT_DIR" || code "$PROJECT_DIR"
+    else
+      run_step "Open in VS Code (new window)" code --new-window "$PROJECT_DIR" || code "$PROJECT_DIR"
+    fi
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    run_step "Open in VS Code (AppleScript fallback)" osascript -e \
+      'tell application "Visual Studio Code" to open POSIX file '"\"$PROJECT_DIR\"" || true
+  fi
+fi
+
+printf "\n✅ Project '%s' ready.\n" "$PROJECT_NAME"
